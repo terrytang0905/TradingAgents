@@ -25,6 +25,7 @@ __pycache__/
 *.log
 logs/
 .claude/risk_logs/
+.chainlit/translations/
 results/
 eval_results/
 eval_data/

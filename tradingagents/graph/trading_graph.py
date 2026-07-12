@@ -21,6 +21,7 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.interface import set_config
+from tradingagents.risk_management.pre_flight_check import PreFlightCheck
 
 from .conditional_logic import ConditionalLogic
 from .setup import GraphSetup
@@ -156,6 +157,12 @@ class TradingAgentsGraph:
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""
+
+        preflight = PreFlightCheck(config=self.config)
+        preflight_result = preflight.run(company_name, str(trade_date))
+        if not preflight_result["passed"]:
+            reason = preflight_result.get("blocked_reason") or "pre-flight risk check failed"
+            raise PermissionError(f"Trading blocked by pre-flight check: {reason}")
 
         self.ticker = company_name
 
