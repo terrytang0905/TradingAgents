@@ -1,0 +1,64 @@
+[chainlit]
+# Chainlit configuration for TradingAgents Web UI
+
+# Project info
+project_name = "TradingAgents"
+project_description = "Multi-Agent LLM Financial Trading Framework"
+
+# Theme
+theme = "dark"
+
+# Server
+host = "0.0.0.0"
+port = 8000
+
+# Features
+enable_readme = true
+show_readme = true
+
+# UI
+default_expand_messages = true
+hide_cot = false
+
+# Authentication (disabled for local deployment)
+authentication = false
+
+# CORS (allow local access)
+cors_allowed_origins = ["*"]
+
+# Limits
+max_message_size = 50000
+max_history_messages = 100
+
+# Feedback
+feedback = false
+
+# Persistence (optional)
+# persistence = "local"
+# persistence_path = "./.chainlit"
+
+[features]
+# Enable features
+sound_notifications = false
+user_message_input = true
+
+[ui]
+# Custom UI settings
+# Custom CSS (optional)
+# custom_css = "./static/custom.css"
+
+# Welcome message
+welcome_message = """
+# 🤖 TradingAgents
+
+Welcome to the Multi-Agent LLM Financial Trading Framework!
+
+Type a ticker symbol and date to start analysis.
+
+Example: `NVDA 2024-05-10`
+"""
+
+# Footer
+footer = """
+TradingAgents © 2024 | [GitHub](https://github.com/TauricResearch/TradingAgents)
+"""

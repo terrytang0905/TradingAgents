@@ -1,9 +1,58 @@
+# Python environments and caches
+.venv/
+venv/
 env/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# OS/editor metadata
 .DS_Store
-*.csv
-src/
+.idea/
+.vscode/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime logs and generated outputs
+*.log
+logs/
+.claude/risk_logs/
+results/
 eval_results/
 eval_data/
-*.egg-info/
-.env
+outputs/
+reports/
+
+# Market data, caches, and model artifacts
+tradingagents/dataflows/data_cache/
+data_cache/
+cache/
+models/
+checkpoints/
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+*.parquet
+*.feather
+*.pkl
+*.pickle
+
+# Large ad-hoc datasets should live outside the source tree.
+*.csv
+
+# Build/package outputs
+build/
+dist/
+site/
+
+# Local-only third-party source snapshots
+src/

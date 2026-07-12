@@ -1,0 +1,116 @@
+{
+  "$schema": "https://claude.ai/code/settings.schema.json",
+  "project": "TradingAgents",
+
+  "hooks": {
+    "// PreToolUse - 阻断式检查": "在 propagate() 前强制验证风险限额",
+    "PreToolUse": [
+      {
+        "matcher": "TradingAgentsGraph.propagate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m tradingagents.risk_management.pre_flight_check $CLAUDE_TICKER $CLAUDE_DATE",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+
+    "// PostToolUse - API调用保护": "记录API调用并检查rate limit",
+    "PostToolUse": [
+      {
+        "matcher": "Toolkit.get_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"from tradingagents.monitoring.rate_limiter import RateLimiter; RateLimiter.log_call('${CLAUDE_TOOL_NAME}'.replace('Toolkit.get_', '').replace('_online', '').lower())\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ruff check --fix \"$CLAUDE_FILE\" && ruff format \"$CLAUDE_FILE\"",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+
+    "// PreCommit - 提交前测试门控": "确保风控测试通过才能提交",
+    "PreCommit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pytest tests/test_risk_controller.py -v --tb=short -q",
+            "timeout": 60000
+          }
+        ]
+      }
+    ]
+  },
+
+  "contextManagement": {
+    "model": "claude-opus-4-8",
+    "contextWindow": 1000000,
+    "safetyBuffer": 50000,
+    "dangerThreshold": 0.2,
+    "delegateThreshold": 0.3,
+    "// 说明": "剩余<20%阻断，单任务>30%剩余则委托subagent"
+  },
+
+  "riskLimits": {
+    "// Position Limits": "持仓约束",
+    "max_position_per_symbol": 0.10,
+    "max_position_per_sector": 0.30,
+    "max_concentrated_positions": 5,
+
+    "// Trade Limits": "交易次数约束",
+    "max_daily_trades": 50,
+    "max_hourly_trades": 10,
+    "max_trade_size_usd": 100000,
+    "min_trade_size_usd": 1000,
+
+    "// Portfolio Limits": "组合约束",
+    "max_portfolio_exposure": 0.80,
+    "min_cash_reserve": 0.20,
+
+    "// Stop Loss": "止损规则",
+    "default_stop_loss_pct": 0.05,
+    "trailing_stop_enabled": true,
+    "trailing_stop_pct": 0.03,
+    "hard_stop_pct": 0.10,
+
+    "// API Protection": "API保护",
+    "min_api_quota_reserve": 100
+  },
+
+  "apiRateLimits": {
+    "openai_chat": {"rpm": 500, "tpm": 200000},
+    "openai_embedding": {"rpm": 100},
+    "finnhub": {"rpm": 60},
+    "yfinance": {"rpm": 2000},
+    "google_news": {"rpm": 100},
+    "reddit": {"rpm": 60}
+  },
+
+  "bypassOptions": {
+    "// 说明": "测试模式下可绑过某些检查",
+    "allowBypassRiskCheck": false,
+    "bypassFlag": "--bypass-risk-check",
+    "testModeOnly": true
+  },
+
+  "logging": {
+    "logDir": ".claude/risk_logs",
+    "apiCallLog": "api_calls.log",
+    "preFlightLog": "pre_flight_checks.log",
+    "contextUsageLog": "context_usage.log",
+    "tradeLogDir": "eval_results/trade_logs"
+  }
+}

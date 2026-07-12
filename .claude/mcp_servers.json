@@ -1,0 +1,44 @@
+{
+  "mcpServers": {
+    "alpaca-broker": {
+      "command": "python",
+      "args": ["tradingagents/mcp_servers/alpaca_mcp.py"],
+      "env": {
+        "ALPACA_API_KEY": "${ALPACA_API_KEY}",
+        "ALPACA_SECRET_KEY": "${ALPACA_SECRET_KEY}",
+        "ALPACA_BASE_URL": "${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}"
+      },
+      "description": "Alpaca broker integration for paper/live trading",
+      "tools": [
+        "get_account",
+        "get_positions",
+        "get_position",
+        "submit_order",
+        "cancel_order",
+        "cancel_all_orders",
+        "get_orders",
+        "get_latest_price",
+        "get_portfolio_history"
+      ]
+    },
+    "polygon-data": {
+      "command": "python",
+      "args": ["tradingagents/mcp_servers/polygon_mcp.py"],
+      "env": {
+        "POLYGON_API_KEY": "${POLYGON_API_KEY}"
+      },
+      "description": "Polygon.io real-time and historical market data",
+      "tools": [
+        "get_quote",
+        "get_aggregates",
+        "get_previous_close",
+        "get_company_details",
+        "get_news",
+        "get_snapshot",
+        "search_tickers"
+      ]
+    }
+  },
+  "defaultServer": "polygon-data",
+  "fallbackBehavior": "cache_on_failure"
+}

@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "TradingAgentsGraph.propagate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m tradingagents.risk_management.pre_flight_check $CLAUDE_TICKER $CLAUDE_DATE",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Toolkit.get_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"from tradingagents.monitoring.rate_limiter import RateLimiter; RateLimiter.log_call('${CLAUDE_TOOL_NAME}'.replace('Toolkit.get_', '').replace('_online', '').lower())\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ruff check --fix \"$CLAUDE_FILE\" && ruff format \"$CLAUDE_FILE\"",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}
