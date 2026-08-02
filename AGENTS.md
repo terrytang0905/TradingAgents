@@ -19,8 +19,8 @@
 
 | Parameter | Default | CLI Override | Config Override |
 |-----------|---------|--------------|-----------------|
-| `deep_think_llm` | `o4-mini` | `--model` | `config["deep_think_llm"]` |
-| `quick_think_llm` | `gpt-4o-mini` | `--quick-model` | `config["quick_think_llm"]` |
+| `deep_think_llm` | `deepseek-v4-flash` | `--model` | `config["deep_think_llm"]` |
+| `quick_think_llm` | `deepseek-v4-flash` | `--quick-model` | `config["quick_think_llm"]` |
 | `max_debate_rounds` | `1` | `--debate-rounds` | `config["max_debate_rounds"]` |
 | `max_risk_discuss_rounds` | `1` | `--risk-rounds` | `config["max_risk_discuss_rounds"]` |
 | `online_tools` | `True` | `--offline` | `config["online_tools"]=False` |

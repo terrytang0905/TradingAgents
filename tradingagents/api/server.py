@@ -393,10 +393,16 @@ async def get_config():
     return {
         "config": DEFAULT_CONFIG,
         "overrides": {
+            "llm_provider": os.getenv("LLM_PROVIDER", DEFAULT_CONFIG["llm_provider"]),
+            "backend_url": os.getenv("BACKEND_URL", DEFAULT_CONFIG["backend_url"]),
             "deep_think_llm": os.getenv("DEEP_THINK_LLM", DEFAULT_CONFIG["deep_think_llm"]),
             "quick_think_llm": os.getenv("QUICK_THINK_LLM", DEFAULT_CONFIG["quick_think_llm"]),
-            "max_debate_rounds": int(os.getenv("MAX_DEBATE_ROUNDS", DEFAULT_CONFIG["max_debate_rounds"])),
-            "online_tools": os.getenv("ONLINE_TOOLS", str(DEFAULT_CONFIG["online_tools"])).lower() == "true",
+            "max_debate_rounds": int(
+                os.getenv("MAX_DEBATE_ROUNDS", DEFAULT_CONFIG["max_debate_rounds"])
+            ),
+            "online_tools": (
+                os.getenv("ONLINE_TOOLS", str(DEFAULT_CONFIG["online_tools"])).lower() == "true"
+            ),
         }
     }
 

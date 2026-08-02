@@ -127,6 +127,9 @@ def select_shallow_thinking_agent(provider) -> str:
 
     # Define shallow thinking llm engine options with their corresponding model names
     SHALLOW_AGENT_OPTIONS = {
+        "deepseek": [
+            ("DeepSeek V4 Flash 0731 - default fast trading analysis model", "deepseek-v4-flash"),
+        ],
         "openai": [
             ("GPT-4o-mini - Fast and efficient for quick tasks", "gpt-4o-mini"),
             ("GPT-4.1-nano - Ultra-lightweight model for basic operations", "gpt-4.1-nano"),
@@ -185,6 +188,9 @@ def select_deep_thinking_agent(provider) -> str:
 
     # Define deep thinking llm engine options with their corresponding model names
     DEEP_AGENT_OPTIONS = {
+        "deepseek": [
+            ("DeepSeek V4 Flash 0731 - default deep trading decision model", "deepseek-v4-flash"),
+        ],
         "openai": [
             ("GPT-4.1-nano - Ultra-lightweight model for basic operations", "gpt-4.1-nano"),
             ("GPT-4.1-mini - Compact model with good performance", "gpt-4.1-mini"),
@@ -214,9 +220,9 @@ def select_deep_thinking_agent(provider) -> str:
         "ollama": [
             ("llama3.1 local", "llama3.1"),
             ("qwen3", "qwen3"),
-        ]
+        ],
     }
-    
+
     choice = questionary.select(
         "Select Your [Deep-Thinking LLM Engine]:",
         choices=[
@@ -240,16 +246,17 @@ def select_deep_thinking_agent(provider) -> str:
     return choice
 
 def select_llm_provider() -> tuple[str, str]:
-    """Select the OpenAI api url using interactive selection."""
-    # Define OpenAI api options with their corresponding endpoints
+    """Select the LLM API URL using interactive selection."""
+    # Define LLM API options with their corresponding endpoints
     BASE_URLS = [
+        ("DeepSeek", "https://api.deepseek.com"),
         ("OpenAI", "https://api.openai.com/v1"),
         ("Anthropic", "https://api.anthropic.com/"),
         ("Google", "https://generativelanguage.googleapis.com/v1"),
         ("Openrouter", "https://openrouter.ai/api/v1"),
-        ("Ollama", "http://localhost:11434/v1"),        
+        ("Ollama", "http://localhost:11434/v1"),
     ]
-    
+
     choice = questionary.select(
         "Select your LLM Provider:",
         choices=[
@@ -265,12 +272,12 @@ def select_llm_provider() -> tuple[str, str]:
             ]
         ),
     ).ask()
-    
+
     if choice is None:
         console.print("\n[red]no OpenAI backend selected. Exiting...[/red]")
         exit(1)
-    
+
     display_name, url = choice
     print(f"You selected: {display_name}\tURL: {url}")
-    
+
     return display_name, url
