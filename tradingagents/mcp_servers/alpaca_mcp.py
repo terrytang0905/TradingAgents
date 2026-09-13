@@ -5,15 +5,23 @@ Supports paper trading and live trading modes.
 """
 
 import json
-import asyncio
-from typing import Dict, Any, Optional
-from datetime import datetime
-from mcp.server import Server
-from mcp.types import Tool, TextContent
+from typing import Any, Dict, Optional
+
 import alpaca_trade_api as tradeapi
+from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent
+
+from tradingagents.risk_management.execution_control import (
+    ExecutionCircuitOpen,
+    ExecutionDenied,
+    ExecutionGuard,
+    ExecutionOrder,
+    ExecutionUnavailable,
+)
+from tradingagents.risk_management.risk_data import ALLOWED_ALPACA_BASE_URLS
 
 
-class AlpacaBrokerMCP(Server):
+class AlpacaBrokerMCP:
     """MCP server for Alpaca broker integration.
 
     Provides tools for:
@@ -23,7 +31,13 @@ class AlpacaBrokerMCP(Server):
     - Order cancellation
     """
 
-    def __init__(self, api_key: str, secret_key: str, base_url: str = None):
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        base_url: Optional[str] = None,
+        execution_guard: Optional[ExecutionGuard] = None,
+    ):
         """Initialize Alpaca broker connection.
 
         Args:
@@ -34,13 +48,35 @@ class AlpacaBrokerMCP(Server):
         # Default to paper trading
         if base_url is None:
             base_url = "https://paper-api.alpaca.markets"
+        base_url = base_url.rstrip("/")
+        if base_url not in ALLOWED_ALPACA_BASE_URLS:
+            raise ValueError("base_url must be an approved Alpaca endpoint")
 
-        self.api = tradeapi.REST(api_key, secret_key, base_url)
+        self.api = tradeapi.REST(
+            key_id=api_key,
+            secret_key=secret_key,
+            base_url=base_url,
+            api_version="v2",
+        )
         self.base_url = base_url
+        self.execution_guard = execution_guard or ExecutionGuard.from_environment()
+        self.server = FastMCP("alpaca-broker")
+        self._register_tools()
 
-        super().__init__("alpaca-broker")
+    def _register_tools(self) -> None:
+        for tool in (
+            self.get_account,
+            self.get_positions,
+            self.get_position,
+            self.submit_order,
+            self.cancel_order,
+            self.cancel_all_orders,
+            self.get_orders,
+            self.get_latest_price,
+            self.get_portfolio_history,
+        ):
+            self.server.tool()(tool)
 
-    @Tool
     async def get_account(self) -> TextContent:
         """Get account information.
 
@@ -81,7 +117,6 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def get_positions(self) -> TextContent:
         """Get all current positions.
 
@@ -121,7 +156,6 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def get_position(self, symbol: str) -> TextContent:
         """Get position for a specific symbol.
 
@@ -158,16 +192,18 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def submit_order(
         self,
         symbol: str,
         qty: int,
         side: str,  # "buy" or "sell"
         type: str,  # "market", "limit", "stop", "stop_limit"
-        limit_price: float = None,
-        stop_price: float = None,
-        time_in_force: str = "day"
+        trade_date: str,
+        approval_token: str,
+        client_order_id: str,
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        time_in_force: str = "day",
     ) -> TextContent:
         """Submit an order to Alpaca.
 
@@ -176,6 +212,9 @@ class AlpacaBrokerMCP(Server):
             qty: Number of shares
             side: "buy" or "sell"
             type: Order type
+            trade_date: Date bound to the analysis approval
+            approval_token: Signed capability returned by the analysis API
+            client_order_id: Unique idempotency key for this order
             limit_price: Limit price (for limit/stop_limit orders)
             stop_price: Stop price (for stop/stop_limit orders)
             time_in_force: Order duration
@@ -183,60 +222,70 @@ class AlpacaBrokerMCP(Server):
         Returns:
             Order confirmation with order_id and status
         """
-        try:
-            # Validate inputs
-            if side.lower() not in ["buy", "sell"]:
-                raise ValueError(f"Invalid side: {side}. Must be 'buy' or 'sell'")
+        requested_order = ExecutionOrder(
+            symbol=symbol,
+            quantity=qty,
+            side=side,
+            order_type=type,
+            trade_date=trade_date,
+            approval_token=approval_token,
+            client_order_id=client_order_id,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
+        )
 
-            if type.lower() not in ["market", "limit", "stop", "stop_limit"]:
-                raise ValueError(f"Invalid type: {type}")
+        def latest_price(order_symbol: str) -> float:
+            return float(self.api.get_latest_trade(order_symbol).price)
 
-            # Submit order
+        def submit(execution_order: ExecutionOrder) -> Dict[str, Any]:
             order = self.api.submit_order(
-                symbol=symbol.upper(),
-                qty=qty,
-                side=side.lower(),
-                type=type.lower(),
-                limit_price=limit_price,
-                stop_price=stop_price,
-                time_in_force=time_in_force
+                symbol=execution_order.symbol,
+                qty=execution_order.quantity,
+                side=execution_order.side,
+                type=execution_order.order_type,
+                limit_price=execution_order.limit_price,
+                stop_price=execution_order.stop_price,
+                time_in_force=execution_order.time_in_force,
+                client_order_id=execution_order.client_order_id,
             )
+            return {
+                "id": order.id,
+                "client_order_id": order.client_order_id,
+                "symbol": order.symbol,
+                "qty": order.qty,
+                "side": order.side,
+                "type": order.type,
+                "status": order.status,
+                "limit_price": float(order.limit_price) if order.limit_price else None,
+                "stop_price": float(order.stop_price) if order.stop_price else None,
+                "created_at": str(order.created_at),
+                "submitted_at": str(order.submitted_at) if order.submitted_at else None,
+            }
 
+        try:
+            result = self.execution_guard.execute(
+                requested_order,
+                price_provider=latest_price,
+                submitter=submit,
+            )
             return TextContent(
                 type="text",
-                text=json.dumps({
-                    "status": "success",
-                    "order": {
-                        "id": order.id,
-                        "client_order_id": order.client_order_id,
-                        "symbol": order.symbol,
-                        "qty": order.qty,
-                        "side": order.side,
-                        "type": order.type,
-                        "status": order.status,
-                        "limit_price": float(order.limit_price) if order.limit_price else None,
-                        "stop_price": float(order.stop_price) if order.stop_price else None,
-                        "created_at": str(order.created_at),
-                        "submitted_at": str(order.submitted_at) if order.submitted_at else None,
-                    }
-                }, indent=2)
+                text=json.dumps(result, indent=2),
             )
-        except Exception as e:
+        except (ExecutionDenied, ExecutionCircuitOpen, ExecutionUnavailable) as exc:
             return TextContent(
                 type="text",
-                text=json.dumps({
-                    "status": "error",
-                    "message": str(e),
-                    "order_params": {
-                        "symbol": symbol,
-                        "qty": qty,
-                        "side": side,
-                        "type": type
-                    }
-                })
+                text=json.dumps({"status": "error", "message": str(exc)}),
+            )
+        except Exception:
+            return TextContent(
+                type="text",
+                text=json.dumps(
+                    {"status": "error", "message": "Broker execution is unavailable"}
+                ),
             )
 
-    @Tool
     async def cancel_order(self, order_id: str) -> TextContent:
         """Cancel a pending order.
 
@@ -267,7 +316,6 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def cancel_all_orders(self) -> TextContent:
         """Cancel all pending orders.
 
@@ -293,7 +341,6 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def get_orders(self, status: str = "open") -> TextContent:
         """Get orders by status.
 
@@ -334,7 +381,6 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def get_latest_price(self, symbol: str) -> TextContent:
         """Get latest price for a symbol.
 
@@ -368,7 +414,6 @@ class AlpacaBrokerMCP(Server):
                 })
             )
 
-    @Tool
     async def get_portfolio_history(
         self,
         period: str = "1M",
@@ -409,6 +454,10 @@ class AlpacaBrokerMCP(Server):
                     "message": str(e)
                 })
             )
+
+    def run(self) -> None:
+        """Run the MCP server over standard input/output."""
+        self.server.run(transport="stdio")
 
 
 def run_server():

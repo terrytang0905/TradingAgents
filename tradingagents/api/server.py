@@ -5,44 +5,59 @@ Provides HTTP endpoints for trading analysis.
 Run: python -m tradingagents.api.server
 """
 
-import os
 import json
-import asyncio
+import os
+import secrets
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Dict, Any, Optional, List
-from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Body
+import uvicorn
+from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
-import uvicorn
+from pydantic import BaseModel, ConfigDict, Field
 
-from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.risk_management.pre_flight_check import PreFlightCheck
 from tradingagents.risk_management.risk_limits import RiskLimits
 
-
 # === Pydantic Models ===
+
+class AnalysisConfig(BaseModel):
+    """Per-request analysis settings that are safe for API clients to control."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_debate_rounds: Optional[int] = Field(default=None, ge=1, le=10)
+    max_risk_discuss_rounds: Optional[int] = Field(default=None, ge=1, le=10)
+    online_tools: Optional[bool] = None
+
 
 class TradeRequest(BaseModel):
     """Trade analysis request."""
-    ticker: str = Field(..., description="Ticker symbol (e.g., NVDA, AAPL)")
-    trade_date: str = Field(..., description="Trade date YYYY-MM-DD")
-    config: Optional[Dict[str, Any]] = Field(default=None, description="Optional config overrides")
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
             "example": {
                 "ticker": "NVDA",
                 "trade_date": "2024-05-10",
                 "config": {
                     "max_debate_rounds": 2,
-                    "online_tools": True
-                }
+                    "online_tools": True,
+                },
             }
-        }
+        },
+    )
+
+    ticker: str = Field(..., description="Ticker symbol (e.g., NVDA, AAPL)")
+    trade_date: str = Field(..., description="Trade date YYYY-MM-DD")
+    config: Optional[AnalysisConfig] = Field(
+        default=None,
+        description="Optional safe analysis overrides",
+    )
 
 
 class TradeResponse(BaseModel):
@@ -55,17 +70,22 @@ class TradeResponse(BaseModel):
     reports: Optional[Dict[str, str]] = None
     debate_summary: Optional[Dict[str, Any]] = None
     risk_check: Optional[Dict[str, Any]] = None
+    execution_approval: Optional[str] = None
+    execution_approval_status: Optional[Dict[str, str]] = None
     error: Optional[str] = None
     timestamp: str
 
 
 class BacktestRequest(BaseModel):
     """Backtest request."""
+
+    model_config = ConfigDict(extra="forbid")
+
     tickers: List[str] = Field(..., description="List of ticker symbols")
     start_date: str = Field(..., description="Start date YYYY-MM-DD")
     end_date: str = Field(..., description="End date YYYY-MM-DD")
     initial_capital: float = Field(default=100000, description="Initial capital")
-    config: Optional[Dict[str, Any]] = Field(default=None)
+    config: Optional[AnalysisConfig] = Field(default=None)
 
 
 class AccountStatusResponse(BaseModel):
@@ -86,13 +106,60 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS for local access
+
+def _request_api_key(request: Request) -> Optional[str]:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return request.headers.get("X-API-Key")
+
+
+@app.middleware("http")
+async def require_api_authentication(request: Request, call_next):
+    """Require a server-configured API key for every application API route."""
+    if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+
+    expected_key = os.getenv("TRADINGAGENTS_API_KEY", "").strip()
+    if not expected_key:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "API authentication is not configured"},
+        )
+
+    supplied_key = _request_api_key(request)
+    if not supplied_key or not secrets.compare_digest(supplied_key, expected_key):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing API key"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return await call_next(request)
+
+
+def _cors_origins() -> List[str]:
+    configured = os.getenv(
+        "TRADINGAGENTS_CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    )
+    origins = list(
+        dict.fromkeys(
+            origin.strip() for origin in configured.split(",") if origin.strip()
+        )
+    )
+    if "*" in origins:
+        raise RuntimeError("TRADINGAGENTS_CORS_ORIGINS must not contain '*'")
+    return origins
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for local deployment
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
 # Global instances
@@ -100,13 +167,29 @@ _ta_instance: Optional[TradingAgentsGraph] = None
 _task_results: Dict[str, Dict] = {}  # Background task results
 
 
-def get_trading_agents(config: Dict = None) -> TradingAgentsGraph:
+def _safe_analysis_config(
+    config: Optional[AnalysisConfig | Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if config is None:
+        return {}
+    if isinstance(config, AnalysisConfig):
+        return config.model_dump(exclude_none=True)
+
+    unsupported_keys = sorted(set(config) - set(AnalysisConfig.model_fields))
+    if unsupported_keys:
+        raise ValueError(f"Unsupported analysis config keys: {unsupported_keys}")
+
+    return AnalysisConfig.model_validate(dict(config)).model_dump(exclude_none=True)
+
+
+def get_trading_agents(
+    config: Optional[AnalysisConfig | Mapping[str, Any]] = None,
+) -> TradingAgentsGraph:
     """Get or create TradingAgents instance."""
     global _ta_instance
 
     merged_config = DEFAULT_CONFIG.copy()
-    if config:
-        merged_config.update(config)
+    merged_config.update(_safe_analysis_config(config))
 
     _ta_instance = TradingAgentsGraph(debug=False, config=merged_config)
     return _ta_instance
@@ -190,9 +273,13 @@ async def analyze_trade(request: TradeRequest):
             debate_summary={
                 "bull_history": state.get("investment_debate_state", {}).get("bull_history", ""),
                 "bear_history": state.get("investment_debate_state", {}).get("bear_history", ""),
-                "judge_decision": state.get("investment_debate_state", {}).get("judge_decision", ""),
+                "judge_decision": state.get("investment_debate_state", {}).get(
+                    "judge_decision", ""
+                ),
             },
             risk_check=risk_result,
+            execution_approval=state.get("execution_approval"),
+            execution_approval_status=state.get("execution_approval_status"),
             timestamp=datetime.now().isoformat()
         )
 
@@ -238,26 +325,42 @@ async def analyze_trade_stream(request: TradeRequest):
             ta = get_trading_agents(request.config)
             ta.debug = True
 
+            final_state = None
             for chunk in ta.graph.stream(ta.propagator.create_initial_state(
                 request.ticker, request.trade_date
             ), **ta.propagator.get_graph_args()):
                 if chunk:
+                    final_state = chunk
                     yield json.dumps({
                         "type": "progress",
                         "data": {"step": str(chunk.keys())}
                     }) + "\n"
 
             # Final result
-            state = ta.curr_state
-            decision = state.get("final_trade_decision", "")
+            if final_state is None:
+                raise RuntimeError("Analysis graph returned no final state")
+            decision = ta.process_signal(final_state.get("final_trade_decision", ""))
+            ta._attach_execution_approval(
+                final_state,
+                action=decision,
+                symbol=request.ticker,
+                trade_date=request.trade_date,
+            )
+            ta.curr_state = final_state
+            ta.ticker = request.ticker
+            ta._log_state(request.trade_date, final_state)
 
             yield json.dumps({
                 "type": "complete",
                 "data": {
                     "decision": decision,
+                    "execution_approval": final_state.get("execution_approval"),
+                    "execution_approval_status": final_state.get(
+                        "execution_approval_status"
+                    ),
                     "reports": {
-                        "market": state.get("market_report", ""),
-                        "sentiment": state.get("sentiment_report", ""),
+                        "market": final_state.get("market_report", ""),
+                        "sentiment": final_state.get("sentiment_report", ""),
                     }
                 }
             }) + "\n"
@@ -298,6 +401,8 @@ async def analyze_trade_background(
             _task_results[task_id] = {
                 "status": "success",
                 "decision": decision,
+                "execution_approval": state.get("execution_approval"),
+                "execution_approval_status": state.get("execution_approval_status"),
                 "reports": {
                     "market": state.get("market_report", ""),
                     "sentiment": state.get("sentiment_report", ""),
@@ -408,7 +513,7 @@ async def get_config():
 
 
 @app.post("/api/config")
-async def update_config(config: Dict[str, Any] = Body(...)):
+async def update_config(config: AnalysisConfig):
     """
     Update configuration for subsequent requests.
 
@@ -416,21 +521,12 @@ async def update_config(config: Dict[str, Any] = Body(...)):
     """
     global _ta_instance
 
-    # Validate config keys
-    valid_keys = [
-        "deep_think_llm", "quick_think_llm", "max_debate_rounds",
-        "max_risk_discuss_rounds", "online_tools", "llm_provider", "backend_url"
-    ]
-
-    invalid_keys = [k for k in config.keys() if k not in valid_keys]
-    if invalid_keys:
-        raise HTTPException(400, f"Invalid config keys: {invalid_keys}")
-
     # Reset instance with new config
     _ta_instance = None
-    get_trading_agents(config)
+    safe_config = config.model_dump(exclude_none=True)
+    get_trading_agents(safe_config)
 
-    return {"status": "updated", "config": config}
+    return {"status": "updated", "config": safe_config}
 
 
 @app.get("/api/tickers/search")
@@ -464,11 +560,11 @@ async def search_tickers(query: str = Query(..., min_length=1)):
 
 def run_server(host: str = "0.0.0.0", port: int = 8000):
     """Run the API server."""
-    print(f"\n🚀 Starting TradingAgents API Server...")
+    print("\n🚀 Starting TradingAgents API Server...")
     print(f"   Local: http://localhost:{port}")
     print(f"   Docs: http://localhost:{port}/docs")
     print(f"   ReDoc: http://localhost:{port}/redoc")
-    print(f"\n   Press Ctrl+C to stop\n")
+    print("\n   Press Ctrl+C to stop\n")
 
     uvicorn.run(
         "tradingagents.api.server:app",

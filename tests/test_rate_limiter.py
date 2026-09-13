@@ -1,12 +1,17 @@
 """Tests for Rate Limiter."""
 
-import pytest
-import time
 import threading
-from collections import defaultdict
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+from uuid import uuid4
 
-from tradingagents.monitoring.rate_limiter import RateLimiter, RateLimitConfig
+import pytest
+
+from tradingagents.monitoring.rate_limiter import (
+    RateLimitCallbackHandler,
+    RateLimitConfig,
+    RateLimiter,
+    RateLimitExceeded,
+)
 
 
 class TestRateLimiterConfig:
@@ -39,7 +44,6 @@ class TestRateLimiterConfigure:
         assert RateLimiter.LIMITS["new_api"].rpm == 50
 
     def test_update_existing(self):
-        original = RateLimiter.LIMITS.get("openai_chat", RateLimitConfig(rpm=500))
         RateLimiter.configure("openai_chat", RateLimitConfig(rpm=600))
         assert RateLimiter.LIMITS["openai_chat"].rpm == 600
 
@@ -57,8 +61,8 @@ class TestRateLimiterLogCall:
         assert result["api_type"] == "openai_chat"
         assert result["rpm"] == 1
         assert result["tpm"] == 500
-        assert result["warning"] == False
-        assert result["blocked"] == False
+        assert result["warning"] is False
+        assert result["blocked"] is False
 
     def test_multiple_calls(self):
         for _ in range(5):
@@ -73,7 +77,7 @@ class TestRateLimiterLogCall:
             RateLimiter.log_call("openai_chat")
 
         result = RateLimiter.log_call("openai_chat")  # 451st call
-        assert result["warning"] == True
+        assert result["warning"] is True
 
     def test_block_threshold(self):
         # Make 475 calls (95% of 500)
@@ -81,7 +85,7 @@ class TestRateLimiterLogCall:
             RateLimiter.log_call("openai_chat")
 
         result = RateLimiter.log_call("openai_chat")  # 476th call
-        assert result["blocked"] == True
+        assert result["blocked"] is True
 
 
 class TestRateLimiterCheckCanCall:
@@ -91,22 +95,22 @@ class TestRateLimiterCheckCanCall:
         RateLimiter.reset()
 
     def test_can_call_when_empty(self):
-        assert RateLimiter.check_can_call("openai_chat") == True
+        assert RateLimiter.check_can_call("openai_chat") is True
 
     def test_can_call_under_limit(self):
         for _ in range(100):
             RateLimiter.log_call("openai_chat")
 
-        assert RateLimiter.check_can_call("openai_chat") == True
+        assert RateLimiter.check_can_call("openai_chat") is True
 
     def test_cannot_call_over_threshold(self):
         for _ in range(480):  # Over 95% of 500
             RateLimiter.log_call("openai_chat")
 
-        assert RateLimiter.check_can_call("openai_chat") == False
+        assert RateLimiter.check_can_call("openai_chat") is False
 
     def test_unknown_api_defaults_to_1000(self):
-        assert RateLimiter.check_can_call("unknown_api") == True
+        assert RateLimiter.check_can_call("unknown_api") is True
 
 
 class TestRateLimiterWaitIfNeeded:
@@ -258,3 +262,27 @@ class TestRateLimiterHistoryTrim:
 
         # History should only have 1 entry (the new one)
         assert len(RateLimiter._call_history["openai_chat"]) == 1
+
+
+class TestRateLimitCallbackHandler:
+    def setup_method(self):
+        RateLimiter.reset()
+
+    def test_chat_model_request_is_counted(self):
+        callback = RateLimitCallbackHandler("openai_chat")
+
+        callback.on_chat_model_start({}, [], run_id=uuid4())
+
+        quota = RateLimiter.get_remaining_quota("openai_chat")
+        assert quota["rpm_remaining"] == 499
+
+    def test_chat_model_request_is_blocked_at_threshold(self):
+        RateLimiter.configure(
+            "test_chat",
+            RateLimitConfig(rpm=1, block_threshold=1.0),
+        )
+        RateLimiter.log_call("test_chat")
+        callback = RateLimitCallbackHandler("test_chat")
+
+        with pytest.raises(RateLimitExceeded, match="test_chat"):
+            callback.on_chat_model_start({}, [], run_id=uuid4())

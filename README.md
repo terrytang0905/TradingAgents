@@ -124,6 +124,67 @@ The local default configuration is bound to DeepSeek V4 Flash 0731 (`deepseek-v4
 export DEEPSEEK_API_KEY=$YOUR_DEEPSEEK_API_KEY
 ```
 
+### REST API Security
+
+The REST API fails closed unless a server-side API key is configured. All `/api/*`
+requests must send that key as a Bearer token or `X-API-Key` header.
+
+```bash
+export TRADINGAGENTS_API_KEY="$(openssl rand -hex 32)"
+export TRADINGAGENTS_CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
+tradingagents-api
+```
+
+Model names, providers, and backend URLs are server-owned settings and cannot be
+overridden by API requests. `TRADINGAGENTS_CORS_ORIGINS` must contain explicit,
+comma-separated origins; wildcard origins are rejected at startup.
+
+### Production Pre-flight Risk
+
+Every analysis now fails closed unless it can read a fresh Alpaca account snapshot.
+Configure a paper or live account before starting the API or UI:
+
+```bash
+export ALPACA_API_KEY="$YOUR_ALPACA_API_KEY"
+export ALPACA_SECRET_KEY="$YOUR_ALPACA_SECRET_KEY"
+export ALPACA_BASE_URL="https://paper-api.alpaca.markets"
+```
+
+The pre-flight gate reads broker-reported portfolio value, cash, positions, `FILL`
+activities, account restrictions, and the market clock. It also checks the
+process-local LLM rate limiter and calculates a deterministic utilization score from
+the configured account limits. Missing, stale, incomplete, or invalid data blocks the
+run; legacy `mock_*` config values are ignored.
+
+Trading hours are enforced by default. Internal backtests may explicitly set
+`config["enforce_trading_hours"] = False`; this setting is not accepted from REST API
+requests. Multi-worker deployments need a shared rate-limit store before the local API
+quota check can be treated as deployment-wide capacity.
+
+### Controlled Alpaca Execution
+
+Broker submission is separate from analysis and is closed unless an execution signing
+key is configured:
+
+```bash
+export TRADINGAGENTS_EXECUTION_SIGNING_KEY="$(openssl rand -hex 32)"
+export TRADINGAGENTS_EXECUTION_DB=".tradingagents/execution.sqlite3"
+```
+
+For `BUY` or `SELL`, the authenticated analysis response can include a short-lived
+`execution_approval`. The Alpaca MCP `submit_order` tool requires that token, its bound
+trade date, and a unique `client_order_id`. Immediately before submission it reads a
+fresh broker snapshot, applies the hard `RiskController`, checks trading hours,
+position, exposure and cash limits, atomically consumes the approval, and records the
+broker response for idempotent replay. Repeated broker failures open a persistent
+circuit breaker. `HOLD` and any unavailable risk dependency produce no approval.
+
+The legacy `AlpacaBroker.submit_order` path is disabled so it cannot bypass these
+controls. The default SQLite state store supports multiple workers on one host using a
+shared file. A multi-host deployment must replace it with a transactional shared store
+that preserves unique approval and `client_order_id` constraints before enabling live
+trading.
+
 ### CLI Usage
 
 You can also try out the CLI directly by running:
@@ -157,13 +218,15 @@ We built TradingAgents with LangGraph to ensure flexibility and modularity. This
 To use TradingAgents inside your code, you can import the `tradingagents` module and initialize a `TradingAgentsGraph()` object. The `.propagate()` function will return a decision. You can run `main.py`, here's also a quick example:
 
 ```python
-from tradingagents.graph.trading_graph import TradingAgentsGraph
+from datetime import date
+
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG.copy())
 
 # forward propagate
-_, decision = ta.propagate("NVDA", "2024-05-10")
+_, decision = ta.propagate("NVDA", date.today().isoformat())
 print(decision)
 ```
 

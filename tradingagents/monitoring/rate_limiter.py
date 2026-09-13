@@ -4,14 +4,20 @@ Monitors and protects API calls from exceeding rate limits.
 Integrated via Hook (PostToolUse) and manual calls in dataflows.
 """
 
-from collections import defaultdict
-from typing import Dict, List, Optional
-import time
 import json
 import threading
-from pathlib import Path
-from dataclasses import dataclass
+import time
+from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List
+
+from langchain_core.callbacks import BaseCallbackHandler
+
+
+class RateLimitExceeded(RuntimeError):
+    """Raised before a model request when the local quota is exhausted."""
 
 
 @dataclass
@@ -73,6 +79,38 @@ class RateLimiter:
         cls.LIMITS[api_type] = config
 
     @classmethod
+    def reserve_call(cls, api_type: str) -> bool:
+        """Atomically reserve one request from the active RPM window."""
+        now = time.time()
+        with cls._lock:
+            config = cls.LIMITS.get(api_type)
+            if config is None:
+                return False
+
+            recent = [
+                call
+                for call in cls._call_history.get(api_type, [])
+                if now - call["timestamp"] < 60
+            ]
+            current_rpm = len(recent)
+            current_tpm = sum(call["tokens"] for call in recent)
+            if current_rpm >= config.rpm * config.block_threshold:
+                return False
+            if config.tpm > 0 and current_tpm >= config.tpm * config.block_threshold:
+                return False
+
+            recent.append({"timestamp": now, "tokens": 0, "metadata": {}})
+            cls._call_history[api_type] = recent
+            result = {
+                "api_type": api_type,
+                "rpm": len(recent),
+                "rpm_limit": config.rpm,
+                "reserved": True,
+            }
+            cls._persist_log(result)
+            return True
+
+    @classmethod
     def log_call(cls, api_type: str, tokens: int = 0,
                  metadata: Dict = None) -> Dict:
         """Log an API call and check rate limits.
@@ -116,7 +154,9 @@ class RateLimiter:
             tpm_pct = current_tpm / tpm_limit if tpm_limit > 0 else 0
 
             warning = rpm_pct >= config.warning_threshold or tpm_pct >= config.warning_threshold
-            blocked = rpm_pct >= config.block_threshold or (tpm_limit > 0 and tpm_pct >= config.block_threshold)
+            blocked = rpm_pct >= config.block_threshold or (
+                tpm_limit > 0 and tpm_pct >= config.block_threshold
+            )
 
             result = {
                 "api_type": api_type,
@@ -132,7 +172,10 @@ class RateLimiter:
 
             # Log warnings/blocks
             if warning:
-                msg = f"⚠️ Rate Limit Warning: {api_type} at RPM:{current_rpm}/{rpm_limit} TPM:{current_tpm}/{tpm_limit}"
+                msg = (
+                    f"⚠️ Rate Limit Warning: {api_type} at "
+                    f"RPM:{current_rpm}/{rpm_limit} TPM:{current_tpm}/{tpm_limit}"
+                )
                 print(msg)
 
             if blocked:
@@ -245,7 +288,10 @@ class RateLimiter:
             config = cls.LIMITS.get(api_type, RateLimitConfig(rpm=1000))
 
             rpm_remaining = max(0, config.rpm - current_rpm)
-            tpm_remaining = max(0, config.tpm - current_tpm) if config.tpm > 0 else -1  # -1 = no limit
+            # A value of -1 means that the API has no configured TPM limit.
+            tpm_remaining = (
+                max(0, config.tpm - current_tpm) if config.tpm > 0 else -1
+            )
 
             return {
                 "rpm_remaining": rpm_remaining,
@@ -266,7 +312,11 @@ class RateLimiter:
         for api_type, config in cls.LIMITS.items():
             quota = cls.get_remaining_quota(api_type)
             rpm_pct = 1 - quota["rpm_remaining"] / quota["rpm_limit"]
-            tpm_pct = 1 - quota["tpm_remaining"] / quota["tpm_limit"] if quota["tpm_limit"] > 0 else 0
+            tpm_pct = (
+                1 - quota["tpm_remaining"] / quota["tpm_limit"]
+                if quota["tpm_limit"] > 0
+                else 0
+            )
 
             # Determine status color
             if rpm_pct >= config.block_threshold or tpm_pct >= config.block_threshold:
@@ -284,7 +334,11 @@ class RateLimiter:
                 "rpm_limit": quota["rpm_limit"],
                 "rpm_remaining": quota["rpm_remaining"],
                 "rpm_pct": rpm_pct,
-                "tpm_current": quota["tpm_limit"] - quota["tpm_remaining"] if quota["tpm_limit"] > 0 else 0,
+                "tpm_current": (
+                    quota["tpm_limit"] - quota["tpm_remaining"]
+                    if quota["tpm_limit"] > 0
+                    else 0
+                ),
                 "tpm_limit": quota["tpm_limit"],
                 "tpm_remaining": quota["tpm_remaining"],
                 "tpm_pct": tpm_pct,
@@ -321,6 +375,27 @@ class RateLimiter:
 
         with open(cls.LOG_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+
+class RateLimitCallbackHandler(BaseCallbackHandler):
+    """Count and enforce real LangChain model requests in the local limiter."""
+
+    raise_error = True
+
+    def __init__(self, api_type: str):
+        self.api_type = api_type
+
+    def _reserve(self) -> None:
+        if not RateLimiter.reserve_call(self.api_type):
+            raise RateLimitExceeded(f"API quota exhausted for {self.api_type}")
+
+    def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
+        del serialized, messages, kwargs
+        self._reserve()
+
+    def on_llm_start(self, serialized, prompts, **kwargs) -> None:
+        del serialized, prompts, kwargs
+        self._reserve()
 
 
 def show_status():

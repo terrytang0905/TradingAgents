@@ -14,10 +14,13 @@ RiskController - 硬性风险控制模块
 Created: 2026-06-03
 """
 
-from dataclasses import dataclass
-from typing import Dict, Any, Optional
-from datetime import datetime
 import json
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from .risk_data import RiskSnapshot
+from .risk_limits import RiskLimits as ExecutionRiskLimits
 
 
 @dataclass
@@ -71,13 +74,18 @@ class RiskControlResult:
 class RiskController:
     """硬性风险控制器"""
 
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(
+        self,
+        config: Dict[str, Any] = None,
+        execution_limits: Optional[ExecutionRiskLimits] = None,
+    ):
         """初始化风险控制器
 
         Args:
             config: 配置字典，包含风险限制参数
         """
         self.risk_limits = RiskLimits()
+        self.execution_limits = execution_limits or ExecutionRiskLimits.load_from_config()
 
         # 应用自定义配置
         if config:
@@ -86,6 +94,82 @@ class RiskController:
                     setattr(self.risk_limits, key, value)
 
         self.risk_log = []  # 风控日志
+
+    def max_approved_notional(
+        self,
+        action: str,
+        ticker: str,
+        snapshot: RiskSnapshot,
+    ) -> float:
+        """Return the maximum new notional allowed by current account limits."""
+        symbol = ticker.upper()
+        normalized_action = action.upper()
+        if normalized_action == "SELL":
+            quantity = snapshot.position_quantities.get(symbol, 0.0)
+            if quantity <= 0:
+                return 0.0
+            return max(0.0, abs(snapshot.positions.get(symbol, 0.0)))
+        if normalized_action != "BUY":
+            return 0.0
+
+        limits = self.execution_limits
+        portfolio_value = snapshot.portfolio_value
+        current_position = abs(snapshot.positions.get(symbol, 0.0))
+        position_headroom = (
+            limits.max_position_per_symbol * portfolio_value - current_position
+        )
+        exposure_headroom = (
+            limits.max_portfolio_exposure * portfolio_value - snapshot.gross_exposure
+        )
+        cash_headroom = snapshot.cash - limits.min_cash_reserve * portfolio_value
+        return max(
+            0.0,
+            min(
+                limits.max_trade_size_usd,
+                position_headroom,
+                exposure_headroom,
+                cash_headroom,
+            ),
+        )
+
+    def validate_execution_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: float,
+        snapshot: RiskSnapshot,
+        approved_max_notional: float,
+    ) -> list[str]:
+        """Validate a concrete order against fresh account state."""
+        limits = self.execution_limits
+        ticker = symbol.upper()
+        notional = quantity * price
+        reasons = []
+
+        if notional > approved_max_notional:
+            reasons.append("Order exceeds approved notional")
+        if notional > limits.max_trade_size_usd:
+            reasons.append("Order exceeds maximum trade size")
+
+        if side.lower() == "sell":
+            available_quantity = snapshot.position_quantities.get(ticker, 0.0)
+            if available_quantity <= 0 or quantity > available_quantity:
+                reasons.append("Sell quantity exceeds the current long position")
+            return reasons
+
+        if notional < limits.min_trade_size_usd:
+            reasons.append("Order is below minimum trade size")
+        projected_position = abs(snapshot.positions.get(ticker, 0.0)) + notional
+        if projected_position / snapshot.portfolio_value > limits.max_position_per_symbol:
+            reasons.append("Order would exceed the symbol position limit")
+        projected_exposure = snapshot.gross_exposure + notional
+        if projected_exposure / snapshot.portfolio_value > limits.max_portfolio_exposure:
+            reasons.append("Order would exceed the portfolio exposure limit")
+        projected_cash = snapshot.cash - notional
+        if projected_cash / snapshot.portfolio_value < limits.min_cash_reserve:
+            reasons.append("Order would breach the minimum cash reserve")
+        return reasons
 
     def enforce_risk_limits(
         self,
@@ -343,11 +427,11 @@ if __name__ == "__main__":
     print(f"\n原始决策: {decision.action} {decision.ticker} (建议仓位{decision.position_size:.2%})")
     print(f"风控结果: {result.final_action} (最终仓位{result.final_position_size:.2%})")
     print(f"批准状态: {result.approved}")
-    print(f"\n风险警告:")
+    print("\n风险警告:")
     for warning in result.risk_warnings:
         print(f"  - {warning}")
 
-    print(f"\n强制执行原因:")
+    print("\n强制执行原因:")
     for reason in result.enforcement_reasons:
         print(f"  - {reason}")
 

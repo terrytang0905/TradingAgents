@@ -22,5 +22,12 @@ DEFAULT_CONFIG = {
     "max_recur_limit": 100,
     # Tool settings
     "online_tools": True,
-    "enforce_trading_hours": False,
+    "enforce_trading_hours": True,
+    "risk_snapshot_max_age_seconds": 30,
+    "risk_api_type": "openai_chat",
+    # Broker execution controls
+    "execution_approval_ttl_seconds": 300,
+    "execution_db_path": ".tradingagents/execution.sqlite3",
+    "execution_circuit_failure_threshold": 3,
+    "execution_circuit_cooldown_seconds": 300,
 }

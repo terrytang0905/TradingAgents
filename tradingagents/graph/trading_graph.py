@@ -1,33 +1,36 @@
 # TradingAgents/graph/trading_graph.py
 
+import json
 import os
 from pathlib import Path
-import json
-from datetime import date
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Any, Dict, List
 
-from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
-
+from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
 
-from tradingagents.agents import *
-from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.agents import Toolkit
 from tradingagents.agents.utils.memory import FinancialSituationMemory
-from tradingagents.agents.utils.agent_states import (
-    AgentState,
-    InvestDebateState,
-    RiskDebateState,
-)
 from tradingagents.dataflows.interface import set_config
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.monitoring.rate_limiter import RateLimitCallbackHandler
+from tradingagents.risk_management.execution_control import (
+    ExecutionApprovalIssuer,
+    ExecutionDenied,
+)
 from tradingagents.risk_management.pre_flight_check import PreFlightCheck
 
 from .conditional_logic import ConditionalLogic
-from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
+from .setup import GraphSetup
 from .signal_processing import SignalProcessor
+
+
+def _model_callbacks(config: Dict[str, Any]) -> List[RateLimitCallbackHandler]:
+    api_type = config.get("risk_api_type", DEFAULT_CONFIG["risk_api_type"])
+    return [RateLimitCallbackHandler(api_type)]
 
 
 class TradingAgentsGraph:
@@ -60,35 +63,54 @@ class TradingAgentsGraph:
 
         # Initialize LLMs
         provider = self.config["llm_provider"].lower()
+        callbacks = _model_callbacks(self.config)
         if provider in {"openai", "ollama", "openrouter"}:
             self.deep_thinking_llm = ChatOpenAI(
                 model=self.config["deep_think_llm"],
                 base_url=self.config["backend_url"],
+                callbacks=callbacks,
             )
             self.quick_thinking_llm = ChatOpenAI(
                 model=self.config["quick_think_llm"],
                 base_url=self.config["backend_url"],
+                callbacks=callbacks,
             )
         elif provider == "deepseek":
             self.deep_thinking_llm = ChatOpenAI(
                 model=self.config["deep_think_llm"],
                 base_url=self.config["backend_url"],
                 api_key=os.getenv("DEEPSEEK_API_KEY"),
+                callbacks=callbacks,
             )
             self.quick_thinking_llm = ChatOpenAI(
                 model=self.config["quick_think_llm"],
                 base_url=self.config["backend_url"],
                 api_key=os.getenv("DEEPSEEK_API_KEY"),
+                callbacks=callbacks,
             )
         elif provider == "anthropic":
-            self.deep_thinking_llm = ChatAnthropic(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
-            self.quick_thinking_llm = ChatAnthropic(model=self.config["quick_think_llm"], base_url=self.config["backend_url"])
+            self.deep_thinking_llm = ChatAnthropic(
+                model=self.config["deep_think_llm"],
+                base_url=self.config["backend_url"],
+                callbacks=callbacks,
+            )
+            self.quick_thinking_llm = ChatAnthropic(
+                model=self.config["quick_think_llm"],
+                base_url=self.config["backend_url"],
+                callbacks=callbacks,
+            )
         elif provider == "google":
-            self.deep_thinking_llm = ChatGoogleGenerativeAI(model=self.config["deep_think_llm"])
-            self.quick_thinking_llm = ChatGoogleGenerativeAI(model=self.config["quick_think_llm"])
+            self.deep_thinking_llm = ChatGoogleGenerativeAI(
+                model=self.config["deep_think_llm"],
+                callbacks=callbacks,
+            )
+            self.quick_thinking_llm = ChatGoogleGenerativeAI(
+                model=self.config["quick_think_llm"],
+                callbacks=callbacks,
+            )
         else:
             raise ValueError(f"Unsupported LLM provider: {self.config['llm_provider']}")
-        
+
         self.toolkit = Toolkit(config=self.config)
 
         # Initialize memories
@@ -205,14 +227,21 @@ class TradingAgentsGraph:
             # Standard mode without tracing
             final_state = self.graph.invoke(init_agent_state, **args)
 
+        processed_signal = self.process_signal(final_state["final_trade_decision"])
+        self._attach_execution_approval(
+            final_state,
+            action=processed_signal,
+            symbol=company_name,
+            trade_date=str(trade_date),
+        )
+
         # Store current state for reflection
         self.curr_state = final_state
 
         # Log state
         self._log_state(trade_date, final_state)
 
-        # Return decision and processed signal
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+        return final_state, processed_signal
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
@@ -255,6 +284,39 @@ class TradingAgentsGraph:
             "w",
         ) as f:
             json.dump(self.log_states_dict, f, indent=4)
+
+    def _attach_execution_approval(
+        self,
+        final_state: Dict[str, Any],
+        action: str,
+        symbol: str,
+        trade_date: str,
+    ) -> None:
+        """Attach a short-lived capability for the controlled executor."""
+        try:
+            token = ExecutionApprovalIssuer.from_environment(self.config).issue(
+                action,
+                symbol,
+                trade_date,
+            )
+            final_state["execution_approval"] = token
+            final_state["execution_approval_status"] = (
+                {"status": "approved"}
+                if token
+                else {"status": "not_required", "reason": "Analysis returned HOLD"}
+            )
+        except ExecutionDenied as exc:
+            final_state["execution_approval"] = None
+            final_state["execution_approval_status"] = {
+                "status": "denied",
+                "reason": str(exc),
+            }
+        except Exception:
+            final_state["execution_approval"] = None
+            final_state["execution_approval_status"] = {
+                "status": "unavailable",
+                "reason": "Execution approval could not be issued safely",
+            }
 
     def reflect_and_remember(self, returns_losses):
         """Reflect on decisions and update memory based on returns."""

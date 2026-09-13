@@ -1,429 +1,495 @@
-"""Pre-flight Risk Check for TradingAgents.
+"""Fail-closed pre-flight risk checks for TradingAgents."""
 
-Enforced by Hook before propagate() execution.
-Returns exit code 0 (PASS) or 1 (BLOCKED).
-"""
-
-import sys
 import json
+import sys
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
+from tradingagents.default_config import DEFAULT_CONFIG
+
+from .risk_data import (
+    MARKET_TIMEZONE,
+    QuotaProvider,
+    RateLimiterQuotaProvider,
+    RiskDataProvider,
+    RiskDataUnavailable,
+    RiskSnapshot,
+    calculate_risk_score,
+    default_risk_data_provider,
+)
 from .risk_limits import RiskLimits
 
 
 class PreFlightCheck:
-    """Risk validation before propagate() execution.
+    """Validate authoritative account state before graph execution."""
 
-    Usage:
-        checker = PreFlightCheck()
-        result = checker.run("NVDA", "2024-05-10")
-
-        if result["passed"]:
-            # Proceed with propagate()
-        else:
-            # Block execution, log reason
-    """
-
-    # Log file for all checks
     LOG_DIR = Path(".claude/risk_logs")
     LOG_FILE = LOG_DIR / "pre_flight_checks.log"
 
-    def __init__(self, limits: RiskLimits = None, config: Dict[str, Any] = None):
-        """Initialize pre-flight checker.
-
-        Args:
-            limits: RiskLimits instance (loads default if None)
-            config: Optional config dict for additional settings
-        """
-        self.limits = limits or RiskLimits.load_from_config(config)
-        self.config = config or {}
+    def __init__(
+        self,
+        limits: Optional[RiskLimits] = None,
+        config: Optional[Dict[str, Any]] = None,
+        data_provider: Optional[RiskDataProvider] = None,
+        quota_provider: Optional[QuotaProvider] = None,
+    ):
+        self.config = dict(config or {})
+        self.limits = limits or RiskLimits.load_from_config(self.config)
+        self.data_provider = data_provider or default_risk_data_provider()
+        api_type = self.config.get("risk_api_type", DEFAULT_CONFIG["risk_api_type"])
+        self.quota_provider = quota_provider or RateLimiterQuotaProvider(api_type)
+        self._snapshot: Optional[RiskSnapshot] = None
+        self._api_quota_remaining: Optional[int] = None
         self._setup_logging()
 
-    def _setup_logging(self):
-        """Ensure log directory exists."""
+    def _setup_logging(self) -> None:
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    def run(self, ticker: str, trade_date: str) -> Dict[str, Any]:
-        """Execute all pre-flight checks.
-
-        Args:
-            ticker: Symbol to trade
-            trade_date: Date string YYYY-mm-dd
-
-        Returns:
-            Dict with 'passed', 'checks', 'blocked_reason'
-        """
-        results = {
+    def run(
+        self,
+        ticker: str,
+        trade_date: str,
+        action: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute all checks against one fresh broker snapshot."""
+        ticker = ticker.upper()
+        results: Dict[str, Any] = {
             "ticker": ticker,
             "trade_date": trade_date,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "checks": [],
             "passed": True,
             "blocked_reason": None,
-            "warnings": []
+            "warnings": [],
         }
+        self._snapshot = None
+        self._api_quota_remaining = None
 
-        # Execute all checks in order
+        try:
+            date.fromisoformat(trade_date)
+            self._snapshot = self.data_provider.capture(ticker, trade_date)
+            freshness = self._check_snapshot_freshness()
+            results["checks"].append(freshness)
+            if not freshness["passed"]:
+                results["passed"] = False
+                results["blocked_reason"] = freshness["reason"]
+                self._log_result(results)
+                return results
+        except (ValueError, RiskDataUnavailable) as exc:
+            self._block_for_data_error(results, "risk_data", str(exc))
+            self._log_result(results)
+            return results
+        except Exception:
+            self._block_for_data_error(
+                results,
+                "risk_data",
+                "Authoritative broker risk data is unavailable",
+            )
+            self._log_result(results)
+            return results
+
+        normalized_action = action.lower() if action else None
+        if normalized_action not in {None, "buy", "sell"}:
+            self._block_for_data_error(results, "risk_data", "Invalid execution action")
+            self._log_result(results)
+            return results
+
         checks = [
-            ("position_limit", self._check_position_limit),
+            ("account_status", self._check_account_status),
             ("daily_trades", self._check_daily_trades),
             ("hourly_trades", self._check_hourly_trades),
-            ("portfolio_exposure", self._check_portfolio_exposure),
-            ("cash_reserve", self._check_cash_reserve),
-            ("api_quota", self._check_api_quota),
-            ("risk_score", self._check_risk_score),
         ]
-        if self.config.get("enforce_trading_hours", False):
-            checks.insert(-1, ("trading_hours", self._check_trading_hours))
+        if normalized_action != "sell":
+            checks.extend(
+                [
+                    ("position_limit", self._check_position_limit),
+                    ("portfolio_exposure", self._check_portfolio_exposure),
+                    ("cash_reserve", self._check_cash_reserve),
+                    ("risk_score", self._check_risk_score),
+                ]
+            )
+        if normalized_action is None:
+            checks.append(("api_quota", self._check_api_quota))
+        enforce_hours = self.config.get(
+            "enforce_trading_hours", DEFAULT_CONFIG["enforce_trading_hours"]
+        )
+        if enforce_hours:
+            checks.append(("trading_hours", self._check_trading_hours))
 
         for check_name, check_func in checks:
             try:
                 check_result = check_func(ticker, trade_date)
+                check_result.setdefault("source", self._require_snapshot().source)
                 results["checks"].append(check_result)
-
                 if not check_result["passed"]:
                     results["passed"] = False
                     results["blocked_reason"] = check_result["reason"]
-
-                    # First failure blocks; no need to continue
                     break
-
                 if check_result.get("warning"):
                     results["warnings"].append(check_result["warning"])
-
-            except Exception as e:
-                # Exception during check = block with error
-                results["checks"].append({
-                    "name": check_name,
-                    "passed": False,
-                    "reason": f"Check error: {str(e)}",
-                    "error": True
-                })
-                results["passed"] = False
-                results["blocked_reason"] = f"Check '{check_name}' failed: {str(e)}"
+            except RiskDataUnavailable as exc:
+                self._block_for_data_error(results, check_name, str(exc))
+                break
+            except Exception:
+                self._block_for_data_error(
+                    results,
+                    check_name,
+                    f"Check '{check_name}' could not be completed safely",
+                )
                 break
 
-        # Log result
         self._log_result(results)
-
         return results
 
-    def _check_position_limit(self, ticker: str, trade_date: str) -> Dict:
-        """Check if position limit reached for symbol."""
+    @property
+    def snapshot(self) -> Optional[RiskSnapshot]:
+        """Return the snapshot used by the most recent completed run."""
+        return self._snapshot
+
+    def _check_snapshot_freshness(self) -> Dict[str, Any]:
+        snapshot = self._require_snapshot()
+        captured_at = snapshot.captured_at
+        if captured_at.tzinfo is None:
+            raise RiskDataUnavailable("Broker snapshot timestamp has no timezone")
+
+        age_seconds = (
+            datetime.now(timezone.utc) - captured_at.astimezone(timezone.utc)
+        ).total_seconds()
+        max_age = int(
+            self.config.get(
+                "risk_snapshot_max_age_seconds",
+                DEFAULT_CONFIG["risk_snapshot_max_age_seconds"],
+            )
+        )
+        if max_age <= 0:
+            raise RiskDataUnavailable("risk_snapshot_max_age_seconds must be positive")
+        if age_seconds < -5:
+            return {
+                "name": "risk_data",
+                "passed": False,
+                "reason": "Broker snapshot timestamp is in the future",
+                "source": snapshot.source,
+                "age_seconds": round(age_seconds, 3),
+            }
+        if age_seconds > max_age:
+            return {
+                "name": "risk_data",
+                "passed": False,
+                "reason": (
+                    f"Broker risk data is stale: {age_seconds:.1f}s old "
+                    f"(max {max_age}s)"
+                ),
+                "source": snapshot.source,
+                "age_seconds": round(age_seconds, 3),
+            }
+        return {
+            "name": "risk_data",
+            "passed": True,
+            "reason": None,
+            "source": snapshot.source,
+            "age_seconds": round(max(0.0, age_seconds), 3),
+        }
+
+    def _check_account_status(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker, trade_date
+        snapshot = self._require_snapshot()
+        if not snapshot.account_ready:
+            return {
+                "name": "account_status",
+                "passed": False,
+                "reason": (
+                    "Broker account is not ready: "
+                    f"status={snapshot.account_status}, "
+                    f"trading_blocked={snapshot.trading_blocked}, "
+                    f"account_blocked={snapshot.account_blocked}"
+                ),
+            }
+        return {
+            "name": "account_status",
+            "passed": True,
+            "reason": None,
+            "status": snapshot.account_status,
+        }
+
+    def _check_position_limit(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del trade_date
         positions = self._get_current_positions()
         portfolio_value = self._get_portfolio_value()
-
-        if ticker in positions:
-            current_pct = positions[ticker] / portfolio_value
-            limit_pct = self.limits.max_position_per_symbol
-
-            if current_pct >= limit_pct:
-                return {
-                    "name": "position_limit",
-                    "passed": False,
-                    "reason": (
-                        f"Position limit: {ticker} at {current_pct:.2%} "
-                        f">= limit {limit_pct:.2%}"
-                    ),
-                    "current": current_pct,
-                    "limit": limit_pct
-                }
-
-            # Warning at 80% of limit
-            if current_pct >= limit_pct * 0.8:
-                return {
-                    "name": "position_limit",
-                    "passed": True,
-                    "warning": f"{ticker} position at {current_pct:.2%} (80% of limit)",
-                    "current": current_pct,
-                    "limit": limit_pct
-                }
-
+        current_pct = abs(positions.get(ticker, 0.0)) / portfolio_value
+        limit_pct = self.limits.max_position_per_symbol
+        if current_pct >= limit_pct:
+            return {
+                "name": "position_limit",
+                "passed": False,
+                "reason": (
+                    f"Position limit: {ticker} at {current_pct:.2%} "
+                    f">= limit {limit_pct:.2%}"
+                ),
+                "current": current_pct,
+                "limit": limit_pct,
+            }
+        if current_pct >= limit_pct * 0.8:
+            return {
+                "name": "position_limit",
+                "passed": True,
+                "warning": f"{ticker} position at {current_pct:.2%} (80% of limit)",
+                "current": current_pct,
+                "limit": limit_pct,
+            }
         return {
             "name": "position_limit",
             "passed": True,
             "reason": None,
-            "current": positions.get(ticker, 0) / portfolio_value if portfolio_value > 0 else 0
+            "current": current_pct,
+            "limit": limit_pct,
         }
 
-    def _check_daily_trades(self, ticker: str, trade_date: str) -> Dict:
-        """Check if daily trade limit reached."""
+    def _check_daily_trades(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker
         trades_today = self._get_trades_count(trade_date)
         limit = self.limits.max_daily_trades
-
         if trades_today >= limit:
             return {
                 "name": "daily_trades",
                 "passed": False,
                 "reason": f"Daily trades: {trades_today} >= limit {limit}",
                 "current": trades_today,
-                "limit": limit
+                "limit": limit,
             }
-
-        # Warning at 80%
         if trades_today >= limit * 0.8:
             return {
                 "name": "daily_trades",
                 "passed": True,
                 "warning": f"Daily trades at {trades_today} (80% of limit)",
                 "current": trades_today,
-                "limit": limit
+                "limit": limit,
             }
-
         return {
             "name": "daily_trades",
             "passed": True,
+            "reason": None,
             "current": trades_today,
-            "limit": limit
+            "limit": limit,
         }
 
-    def _check_hourly_trades(self, ticker: str, trade_date: str) -> Dict:
-        """Check if hourly trade limit reached."""
-        current_hour = datetime.now().hour
+    def _check_hourly_trades(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker
+        current_hour = self._require_snapshot().captured_at.astimezone(MARKET_TIMEZONE).hour
         trades_this_hour = self._get_trades_count(trade_date, hour=current_hour)
         limit = self.limits.max_hourly_trades
-
         if trades_this_hour >= limit:
             return {
                 "name": "hourly_trades",
                 "passed": False,
                 "reason": f"Hourly trades: {trades_this_hour} >= limit {limit}",
                 "current": trades_this_hour,
-                "limit": limit
+                "limit": limit,
             }
-
         return {
             "name": "hourly_trades",
             "passed": True,
+            "reason": None,
             "current": trades_this_hour,
-            "limit": limit
+            "limit": limit,
         }
 
-    def _check_portfolio_exposure(self, ticker: str, trade_date: str) -> Dict:
-        """Check if portfolio exposure limit reached."""
-        positions = self._get_current_positions()
-        portfolio_value = self._get_portfolio_value()
-
-        total_exposure = sum(positions.values()) / portfolio_value
+    def _check_portfolio_exposure(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker, trade_date
+        total_exposure = self._require_snapshot().gross_exposure / self._get_portfolio_value()
         limit = self.limits.max_portfolio_exposure
-
         if total_exposure >= limit:
             return {
                 "name": "portfolio_exposure",
                 "passed": False,
                 "reason": f"Exposure: {total_exposure:.2%} >= limit {limit:.2%}",
                 "current": total_exposure,
-                "limit": limit
+                "limit": limit,
             }
-
         return {
             "name": "portfolio_exposure",
             "passed": True,
+            "reason": None,
             "current": total_exposure,
-            "limit": limit
+            "limit": limit,
         }
 
-    def _check_cash_reserve(self, ticker: str, trade_date: str) -> Dict:
-        """Check if minimum cash reserve maintained."""
-        positions = self._get_current_positions()
-        portfolio_value = self._get_portfolio_value()
-
-        cash = portfolio_value - sum(positions.values())
-        cash_pct = cash / portfolio_value
+    def _check_cash_reserve(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker, trade_date
+        snapshot = self._require_snapshot()
+        cash_pct = snapshot.cash / snapshot.portfolio_value
         limit = self.limits.min_cash_reserve
-
         if cash_pct < limit:
             return {
                 "name": "cash_reserve",
                 "passed": False,
                 "reason": f"Cash reserve: {cash_pct:.2%} < min {limit:.2%}",
                 "current": cash_pct,
-                "limit": limit
+                "limit": limit,
             }
-
         return {
             "name": "cash_reserve",
             "passed": True,
+            "reason": None,
             "current": cash_pct,
-            "limit": limit
+            "limit": limit,
         }
 
-    def _check_api_quota(self, ticker: str, trade_date: str) -> Dict:
-        """Check API quota reserve."""
+    def _check_api_quota(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker, trade_date
         remaining = self._get_api_quota_remaining()
         min_reserve = self.limits.min_api_quota_reserve
-
         if remaining < min_reserve:
             return {
                 "name": "api_quota",
                 "passed": False,
                 "reason": f"API quota: {remaining} < reserve {min_reserve}",
                 "current": remaining,
-                "limit": min_reserve
+                "limit": min_reserve,
             }
-
-        # Warning at 2x reserve
         if remaining < min_reserve * 2:
             return {
                 "name": "api_quota",
                 "passed": True,
                 "warning": f"API quota low: {remaining} remaining",
                 "current": remaining,
-                "limit": min_reserve
+                "limit": min_reserve,
             }
-
         return {
             "name": "api_quota",
             "passed": True,
+            "reason": None,
             "current": remaining,
-            "limit": min_reserve
+            "limit": min_reserve,
         }
 
-    def _check_trading_hours(self, ticker: str, trade_date: str) -> Dict:
-        """Check if within valid trading hours."""
-        now = datetime.now()
-        hour = now.hour
-
-        start = self.limits.trading_start_hour + self.limits.avoid_first_minutes / 60
-        end = self.limits.trading_end_hour
-
-        # Skip first N minutes
-        if self.limits.avoid_first_minutes > 0:
-            effective_start = self.limits.trading_start_hour + self.limits.avoid_first_minutes
-            if hour == self.limits.trading_start_hour and now.minute < self.limits.avoid_first_minutes:
-                return {
-                    "name": "trading_hours",
-                    "passed": False,
-                    "reason": f"Avoiding first {self.limits.avoid_first_minutes} min volatility",
-                    "current_hour": hour,
-                    "current_minute": now.minute
-                }
-
-        if hour < start or hour >= end:
+    def _check_trading_hours(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del ticker
+        snapshot = self._require_snapshot()
+        broker_time = snapshot.captured_at.astimezone(MARKET_TIMEZONE)
+        if broker_time.date() != date.fromisoformat(trade_date):
             return {
                 "name": "trading_hours",
                 "passed": False,
-                "reason": f"Outside trading hours: {hour}:00 (valid {start}-{end})",
-                "current_hour": hour
+                "reason": "Trade date does not match the broker market date",
+                "market_time": broker_time.isoformat(),
+            }
+        if not snapshot.market_open:
+            return {
+                "name": "trading_hours",
+                "passed": False,
+                "reason": "Broker reports that the market is closed",
+                "market_time": broker_time.isoformat(),
             }
 
+        regular_open = datetime.combine(
+            broker_time.date(),
+            time(self.limits.trading_start_hour, 30),
+            tzinfo=MARKET_TIMEZONE,
+        )
+        effective_start = regular_open + timedelta(minutes=self.limits.avoid_first_minutes)
+        configured_end = datetime.combine(
+            broker_time.date(),
+            time(self.limits.trading_end_hour),
+            tzinfo=MARKET_TIMEZONE,
+        )
+        if broker_time < effective_start:
+            return {
+                "name": "trading_hours",
+                "passed": False,
+                "reason": f"Avoiding first {self.limits.avoid_first_minutes} min volatility",
+                "market_time": broker_time.isoformat(),
+            }
+        if broker_time >= configured_end:
+            return {
+                "name": "trading_hours",
+                "passed": False,
+                "reason": "Outside configured trading hours",
+                "market_time": broker_time.isoformat(),
+            }
         return {
             "name": "trading_hours",
             "passed": True,
-            "current_hour": hour
+            "reason": None,
+            "market_time": broker_time.isoformat(),
         }
 
-    def _check_risk_score(self, ticker: str, trade_date: str) -> Dict:
-        """Check if symbol risk score acceptable."""
-        # This would integrate with a risk scoring system
-        # For now, we mock it or skip
+    def _check_risk_score(self, ticker: str, trade_date: str) -> Dict[str, Any]:
+        del trade_date
         risk_score = self._get_risk_score(ticker)
-
-        if risk_score is None:
-            # No risk score available - pass with warning
-            return {
-                "name": "risk_score",
-                "passed": True,
-                "warning": "Risk score not available",
-                "current": None
-            }
-
         if risk_score > self.limits.max_risk_score:
             return {
                 "name": "risk_score",
                 "passed": False,
                 "reason": f"Risk score: {risk_score} > max {self.limits.max_risk_score}",
                 "current": risk_score,
-                "limit": self.limits.max_risk_score
+                "limit": self.limits.max_risk_score,
             }
-
         return {
             "name": "risk_score",
             "passed": True,
+            "reason": None,
             "current": risk_score,
-            "limit": self.limits.max_risk_score
+            "limit": self.limits.max_risk_score,
         }
 
-    # === Integration Stubs ===
-    # These should be implemented with actual data sources
-
     def _get_current_positions(self) -> Dict[str, float]:
-        """Fetch current positions from portfolio/broker.
-
-        Returns:
-            Dict mapping symbol -> position value (USD)
-        """
-        # TODO: Integrate with broker API (Alpaca, etc.)
-        # For testing, return empty positions
-        return self.config.get("mock_positions", {})
+        return dict(self._require_snapshot().positions)
 
     def _get_portfolio_value(self) -> float:
-        """Fetch total portfolio value.
+        value = self._require_snapshot().portfolio_value
+        if value <= 0:
+            raise RiskDataUnavailable("Broker portfolio value must be positive")
+        return value
 
-        Returns:
-            Portfolio value in USD
-        """
-        # TODO: Integrate with broker API
-        return self.config.get("mock_portfolio_value", 1_000_000)
-
-    def _get_trades_count(self, date: str, hour: int = None) -> int:
-        """Count trades executed on given date/hour.
-
-        Args:
-            date: Date string YYYY-mm-dd
-            hour: Optional hour filter
-
-        Returns:
-            Number of trades
-        """
-        # TODO: Integrate with trade log
-        return self.config.get("mock_trades_count", 0)
+    def _get_trades_count(self, trade_date: str, hour: Optional[int] = None) -> int:
+        del trade_date
+        snapshot = self._require_snapshot()
+        return snapshot.trades_this_hour if hour is not None else snapshot.trades_today
 
     def _get_api_quota_remaining(self) -> int:
-        """Get remaining API quota.
-
-        Returns:
-            Number of API calls remaining in current window
-        """
-        if "mock_api_quota" in self.config:
-            return self.config["mock_api_quota"]
-
-        # TODO: Integrate with rate_limiter
-        try:
-            from tradingagents.monitoring.rate_limiter import RateLimiter
-            quota = RateLimiter.get_remaining_quota("openai_chat")
-            return quota.get("rpm_remaining", 1000)
-        except ImportError:
-            return self.config.get("mock_api_quota", 1000)
+        if self._api_quota_remaining is None:
+            remaining = self.quota_provider.remaining()
+            if not isinstance(remaining, int) or remaining < 0:
+                raise RiskDataUnavailable("API quota provider returned invalid data")
+            self._api_quota_remaining = remaining
+        return self._api_quota_remaining
 
     def _get_risk_score(self, ticker: str) -> int:
-        """Get risk score for symbol.
+        return calculate_risk_score(self._require_snapshot(), self.limits, ticker)
 
-        Returns:
-            Risk score 0-100, or None if unavailable
-        """
-        # TODO: Integrate with risk scoring model
-        return self.config.get("mock_risk_scores", {}).get(ticker)
+    def _require_snapshot(self) -> RiskSnapshot:
+        if self._snapshot is None:
+            raise RiskDataUnavailable("Broker risk snapshot has not been captured")
+        return self._snapshot
 
-    def _log_result(self, results: Dict[str, Any]):
-        """Log check result to file."""
+    def _block_for_data_error(
+        self,
+        results: Dict[str, Any],
+        check_name: str,
+        reason: str,
+    ) -> None:
+        source = self._snapshot.source if self._snapshot else "unavailable"
+        results["checks"].append(
+            {
+                "name": check_name,
+                "passed": False,
+                "reason": reason,
+                "error": True,
+                "source": source,
+            }
+        )
+        results["passed"] = False
+        results["blocked_reason"] = reason
+
+    def _log_result(self, results: Dict[str, Any]) -> None:
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(self.LOG_FILE, "w") as f:
-            json.dump(results, f)
+        with self.LOG_FILE.open("w") as file:
+            json.dump(results, file)
 
 
-def main():
-    """CLI entry point for Hook invocation.
-
-    Usage:
-        python -m tradingagents.risk_management.pre_flight_check <ticker> <date>
-
-    Exit codes:
-        0: PASS - Risk checks cleared
-        1: BLOCKED - Trade blocked by risk limit
-    """
+def main() -> None:
+    """CLI entry point for hook invocation."""
     if len(sys.argv) < 3:
         print("Usage: pre_flight_check <ticker> <date>")
         print("Example: pre_flight_check NVDA 2024-05-10")
@@ -431,38 +497,30 @@ def main():
 
     ticker = sys.argv[1]
     trade_date = sys.argv[2]
-
-    # Optional: Load config from file
     config_path = Path(".claude/risk_limits.json")
-    config = {}
+    config: Dict[str, Any] = {}
     if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
+        with config_path.open() as file:
+            config = json.load(file)
 
-    checker = PreFlightCheck(config=config)
-    result = checker.run(ticker, trade_date)
-
-    # Print result
-    print(f"\n{'='*50}")
+    result = PreFlightCheck(config=config).run(ticker, trade_date)
+    print(f"\n{'=' * 50}")
     print(f"Pre-flight Check: {ticker} on {trade_date}")
-    print(f"{'='*50}")
-
+    print(f"{'=' * 50}")
     for check in result["checks"]:
-        status = "✅ PASS" if check["passed"] else "❌ FAIL"
+        status = "PASS" if check["passed"] else "FAIL"
         print(f"  {status} - {check['name']}")
         if check.get("reason"):
             print(f"    Reason: {check['reason']}")
         if check.get("warning"):
             print(f"    Warning: {check['warning']}")
-
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
 
     if result["passed"]:
-        print("✅ PASS: All checks cleared. Proceed with propagate().")
+        print("PASS: All checks cleared. Proceed with propagate().")
         sys.exit(0)
-    else:
-        print(f"❌ BLOCKED: {result['blocked_reason']}")
-        sys.exit(1)
+    print(f"BLOCKED: {result['blocked_reason']}")
+    sys.exit(1)
 
 
 if __name__ == "__main__":

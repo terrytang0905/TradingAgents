@@ -1,4 +1,4 @@
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from tradingagents.api.server import get_config
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -51,4 +51,5 @@ def test_deepseek_provider_uses_openai_compatible_client_with_deepseek_key(monke
         model="deepseek-v4-flash",
         base_url="https://api.deepseek.com",
         api_key="test-deepseek-key",
+        callbacks=ANY,
     )

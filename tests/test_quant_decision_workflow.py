@@ -1,6 +1,6 @@
 """Executable example of a typical offline quantitative decision workflow."""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -10,10 +10,7 @@ def test_offline_quant_decision_runs_preflight_then_returns_processed_signal(tmp
     """Shows how to run TradingAgentsGraph without live market or LLM calls."""
     config = {
         "online_tools": False,
-        "mock_positions": {"NVDA": 50_000},
-        "mock_portfolio_value": 1_000_000,
-        "mock_trades_count": 2,
-        "mock_api_quota": 1_000,
+        "enforce_trading_hours": False,
     }
     final_state = {
         "company_of_interest": "NVDA",
@@ -53,7 +50,13 @@ def test_offline_quant_decision_runs_preflight_then_returns_processed_signal(tmp
 
     monkeypatch.chdir(tmp_path)
 
-    state, decision = trading_graph.propagate("NVDA", "2024-05-10")
+    with patch("tradingagents.graph.trading_graph.PreFlightCheck") as preflight_cls:
+        preflight_cls.return_value.run.return_value = {
+            "passed": True,
+            "blocked_reason": None,
+            "checks": [],
+        }
+        state, decision = trading_graph.propagate("NVDA", "2024-05-10")
 
     assert state is final_state
     assert decision == "BUY"

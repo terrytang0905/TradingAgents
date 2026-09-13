@@ -1,309 +1,216 @@
-"""Tests for Pre-flight Risk Check."""
+"""Unit tests for fail-closed pre-flight risk checks."""
+
+import json
+from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
-import json
-from pathlib import Path
-from unittest.mock import patch, MagicMock
-from datetime import datetime
 
-from tradingagents.risk_management.pre_flight_check import PreFlightCheck
+from tradingagents.risk_management.pre_flight_check import PreFlightCheck, main
+from tradingagents.risk_management.risk_data import RiskSnapshot
 from tradingagents.risk_management.risk_limits import RiskLimits
 
 
-class TestPreFlightCheckInit:
-    """Test PreFlightCheck initialization."""
+class StaticProvider:
+    def __init__(self, snapshot: RiskSnapshot):
+        self.snapshot = snapshot
 
+    def capture(self, ticker: str, trade_date: str) -> RiskSnapshot:
+        return self.snapshot
+
+
+class StaticQuota:
+    def __init__(self, remaining: int):
+        self.value = remaining
+
+    def remaining(self) -> int:
+        return self.value
+
+
+def snapshot(**overrides) -> RiskSnapshot:
+    values = {
+        "source": "test-broker",
+        "captured_at": datetime.now(timezone.utc),
+        "portfolio_value": 1_000_000,
+        "cash": 700_000,
+        "positions": {"AAPL": 50_000},
+        "position_quantities": {"AAPL": 500},
+        "trades_today": 2,
+        "trades_this_hour": 1,
+        "market_open": True,
+        "account_status": "ACTIVE",
+        "trading_blocked": False,
+        "account_blocked": False,
+    }
+    values.update(overrides)
+    return RiskSnapshot(**values)
+
+
+def checker(
+    broker_snapshot: RiskSnapshot | None = None,
+    quota: int = 500,
+    limits: RiskLimits | None = None,
+    **config,
+) -> PreFlightCheck:
+    instance = PreFlightCheck(
+        limits=limits,
+        config={"enforce_trading_hours": False, **config},
+        data_provider=StaticProvider(broker_snapshot or snapshot()),
+        quota_provider=StaticQuota(quota),
+    )
+    instance._snapshot = broker_snapshot or snapshot()
+    return instance
+
+
+class TestPreFlightCheckInit:
     def test_default_init(self):
-        checker = PreFlightCheck()
-        assert checker.limits is not None
-        assert checker.limits.max_daily_trades == 50
+        instance = PreFlightCheck()
+        assert instance.limits.max_daily_trades == 50
 
     def test_init_with_limits(self):
-        limits = RiskLimits(max_daily_trades=30)
-        checker = PreFlightCheck(limits=limits)
-        assert checker.limits.max_daily_trades == 30
+        instance = PreFlightCheck(limits=RiskLimits(max_daily_trades=30))
+        assert instance.limits.max_daily_trades == 30
 
-    def test_init_with_config(self):
-        config = {
-            "mock_positions": {"AAPL": 100_000},
-            "mock_portfolio_value": 500_000
-        }
-        checker = PreFlightCheck(config=config)
-        assert checker.config == config
+    def test_init_preserves_internal_config(self):
+        config = {"enforce_trading_hours": False}
+        instance = PreFlightCheck(config=config)
+        assert instance.config == config
 
 
 class TestPreFlightCheckRun:
-    """Test run() method."""
+    def test_pass_all_checks(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = checker().run("AAPL", datetime.now().date().isoformat())
 
-    def test_pass_all_checks(self):
-        config = {
-            "mock_positions": {},
-            "mock_portfolio_value": 1_000_000,
-            "mock_trades_count": 0,
-            "mock_api_quota": 1000
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker.run("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
+        assert result["passed"] is True
         assert result["ticker"] == "AAPL"
-        assert result["trade_date"] == "2024-05-10"
-        assert len(result["checks"]) > 0
+        assert len(result["checks"]) == 9
 
-    def test_block_on_first_failure(self):
-        config = {
-            "mock_positions": {"AAPL": 150_000},  # 15% > 10% limit
-            "mock_portfolio_value": 1_000_000
-        }
-        limits = RiskLimits(max_position_per_symbol=0.10)
-        checker = PreFlightCheck(limits=limits, config=config)
-        result = checker.run("AAPL", "2024-05-10")
+    def test_block_on_first_limit_failure(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = checker(snapshot(positions={"AAPL": 150_000})).run(
+            "AAPL", datetime.now().date().isoformat()
+        )
 
-        assert result["passed"] == False
+        assert result["passed"] is False
         assert "position" in result["blocked_reason"].lower()
+        assert result["checks"][-1]["name"] == "position_limit"
 
-    def test_historical_analysis_skips_trading_hours_by_default(self):
-        checker = PreFlightCheck(config={"mock_api_quota": 1000})
-        with patch.object(
-            checker,
-            "_check_trading_hours",
-            return_value={"name": "trading_hours", "passed": False, "reason": "closed"},
-        ) as trading_hours:
-            result = checker.run("AAPL", "2024-05-10")
+    def test_internal_historical_mode_can_disable_hours(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        instance = checker(enforce_trading_hours=False)
+        with patch.object(instance, "_check_trading_hours") as trading_hours:
+            result = instance.run("AAPL", "2024-05-10")
 
         assert result["passed"] is True
         trading_hours.assert_not_called()
 
 
-class TestPositionLimitCheck:
-    """Test position limit check."""
-
+class TestPositionAndPortfolioChecks:
     def test_position_within_limit(self):
-        config = {
-            "mock_positions": {"AAPL": 50_000},
-            "mock_portfolio_value": 1_000_000  # 5% < 10% limit
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker._check_position_limit("AAPL", "2024-05-10")
+        result = checker()._check_position_limit("AAPL", "2024-05-10")
+        assert result["passed"] is True
 
-        assert result["passed"] == True
-
-    def test_position_at_limit(self):
-        config = {
-            "mock_positions": {"AAPL": 100_000},
-            "mock_portfolio_value": 1_000_000  # 10% = limit
-        }
-        limits = RiskLimits(max_position_per_symbol=0.10)
-        checker = PreFlightCheck(limits=limits, config=config)
-        result = checker._check_position_limit("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
+    def test_absolute_short_position_at_limit_is_blocked(self):
+        result = checker(snapshot(positions={"AAPL": -100_000}))._check_position_limit(
+            "AAPL", "2024-05-10"
+        )
+        assert result["passed"] is False
 
     def test_position_warning_threshold(self):
-        config = {
-            "mock_positions": {"AAPL": 85_000},
-            "mock_portfolio_value": 1_000_000  # 8.5% > 80% of 10%
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker._check_position_limit("AAPL", "2024-05-10")
+        result = checker(snapshot(positions={"AAPL": 85_000}))._check_position_limit(
+            "AAPL", "2024-05-10"
+        )
+        assert result["passed"] is True
+        assert result["warning"]
 
-        assert result["passed"] == True
-        assert result.get("warning") is not None
+    def test_gross_exposure_does_not_net_long_and_short_positions(self):
+        broker_snapshot = snapshot(
+            positions={"AAPL": 400_000, "TSLA": -400_000},
+            cash=200_000,
+        )
+        result = checker(broker_snapshot)._check_portfolio_exposure(
+            "AAPL", "2024-05-10"
+        )
+        assert result["passed"] is False
+        assert result["current"] == 0.8
 
-
-class TestDailyTradesCheck:
-    """Test daily trade count check."""
-
-    def test_trades_within_limit(self):
-        config = {"mock_trades_count": 30}
-        checker = PreFlightCheck(config=config)
-        result = checker._check_daily_trades("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
-        assert result["current"] == 30
-
-    def test_trades_at_limit(self):
-        config = {"mock_trades_count": 50}
-        checker = PreFlightCheck(config=config)
-        result = checker._check_daily_trades("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
-        assert "50" in result["reason"]
+    @pytest.mark.parametrize(
+        ("cash", "passed"),
+        [(300_000, True), (150_000, False)],
+    )
+    def test_cash_reserve_uses_broker_cash(self, cash, passed):
+        result = checker(snapshot(cash=cash))._check_cash_reserve("AAPL", "2024-05-10")
+        assert result["passed"] is passed
 
 
-class TestPortfolioExposureCheck:
-    """Test portfolio exposure check."""
+class TestTradeAndQuotaChecks:
+    @pytest.mark.parametrize(
+        ("count", "passed"),
+        [(30, True), (50, False)],
+    )
+    def test_daily_trade_limit(self, count, passed):
+        result = checker(snapshot(trades_today=count))._check_daily_trades(
+            "AAPL", "2024-05-10"
+        )
+        assert result["passed"] is passed
 
-    def test_exposure_within_limit(self):
-        config = {
-            "mock_positions": {"AAPL": 200_000, "GOOGL": 200_000},
-            "mock_portfolio_value": 1_000_000  # 40% < 80%
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker._check_portfolio_exposure("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
-
-    def test_exposure_at_limit(self):
-        config = {
-            "mock_positions": {"AAPL": 400_000, "GOOGL": 400_000},
-            "mock_portfolio_value": 1_000_000  # 80% = limit
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker._check_portfolio_exposure("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
-
-
-class TestCashReserveCheck:
-    """Test cash reserve check."""
-
-    def test_sufficient_cash(self):
-        config = {
-            "mock_positions": {"AAPL": 300_000},
-            "mock_portfolio_value": 1_000_000  # 70% cash > 20% min
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker._check_cash_reserve("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
-
-    def test_insufficient_cash(self):
-        config = {
-            "mock_positions": {"AAPL": 850_000},
-            "mock_portfolio_value": 1_000_000  # 15% cash < 20% min
-        }
-        checker = PreFlightCheck(config=config)
-        result = checker._check_cash_reserve("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
-
-
-class TestAPIQuotaCheck:
-    """Test API quota check."""
-
-    def test_sufficient_quota(self):
-        config = {"mock_api_quota": 500}
-        checker = PreFlightCheck(config=config)
-        result = checker._check_api_quota("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
-
-    def test_low_quota_warning(self):
-        config = {"mock_api_quota": 150}  # 150 < 2*100 reserve
-        checker = PreFlightCheck(config=config)
-        result = checker._check_api_quota("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
-        assert result.get("warning") is not None
-
-    def test_insufficient_quota(self):
-        config = {"mock_api_quota": 50}  # 50 < 100 reserve
-        checker = PreFlightCheck(config=config)
-        result = checker._check_api_quota("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
+    @pytest.mark.parametrize(
+        ("quota", "passed", "warning"),
+        [(500, True, False), (150, True, True), (50, False, False)],
+    )
+    def test_api_quota(self, quota, passed, warning):
+        result = checker(quota=quota)._check_api_quota("AAPL", "2024-05-10")
+        assert result["passed"] is passed
+        assert bool(result.get("warning")) is warning
 
 
 class TestTradingHoursCheck:
-    """Test trading hours check."""
+    def test_within_trading_hours(self):
+        broker_snapshot = snapshot(
+            captured_at=datetime(2025, 1, 2, 15, 30, tzinfo=timezone.utc)
+        )
+        result = checker(broker_snapshot)._check_trading_hours("AAPL", "2025-01-02")
+        assert result["passed"] is True
 
-    @patch('tradingagents.risk_management.pre_flight_check.datetime')
-    def test_within_trading_hours(self, mock_datetime):
-        mock_now = MagicMock()
-        mock_now.hour = 10  # 10 AM
-        mock_now.minute = 30
-        mock_datetime.now.return_value = mock_now
+    def test_broker_closed_market_is_blocked(self):
+        broker_snapshot = snapshot(
+            captured_at=datetime(2025, 1, 2, 15, 30, tzinfo=timezone.utc),
+            market_open=False,
+        )
+        result = checker(broker_snapshot)._check_trading_hours("AAPL", "2025-01-02")
+        assert result["passed"] is False
 
-        checker = PreFlightCheck()
-        result = checker._check_trading_hours("AAPL", "2024-05-10")
-
-        assert result["passed"] == True
-
-    @patch('tradingagents.risk_management.pre_flight_check.datetime')
-    def test_before_trading_hours(self, mock_datetime):
-        mock_now = MagicMock()
-        mock_now.hour = 8  # 8 AM
-        mock_now.minute = 30
-        mock_datetime.now.return_value = mock_now
-
-        checker = PreFlightCheck()
-        result = checker._check_trading_hours("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
-
-    @patch('tradingagents.risk_management.pre_flight_check.datetime')
-    def test_avoid_first_minutes(self, mock_datetime):
-        mock_now = MagicMock()
-        mock_now.hour = 9
-        mock_now.minute = 3  # Within first 5 minutes
-        mock_datetime.now.return_value = mock_now
-
-        checker = PreFlightCheck()
-        result = checker._check_trading_hours("AAPL", "2024-05-10")
-
-        assert result["passed"] == False
+    def test_avoid_first_minutes(self):
+        broker_snapshot = snapshot(
+            captured_at=datetime(2025, 1, 2, 14, 33, tzinfo=timezone.utc)
+        )
+        result = checker(broker_snapshot)._check_trading_hours("AAPL", "2025-01-02")
+        assert result["passed"] is False
 
 
 class TestPreFlightCheckLogging:
-    """Test logging functionality."""
+    def test_log_content(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        instance = checker()
+        instance.LOG_DIR = tmp_path
+        instance.LOG_FILE = tmp_path / "checks.log"
 
-    def test_log_file_created(self, tmp_path):
-        checker = PreFlightCheck()
-        checker.LOG_DIR = tmp_path
-        checker.LOG_FILE = tmp_path / "checks.log"
+        instance.run("AAPL", datetime.now().date().isoformat())
 
-        result = checker.run("AAPL", "2024-05-10")
-        checker._log_result(result)
-
-        assert checker.LOG_FILE.exists()
-
-    def test_log_content(self, tmp_path):
-        checker = PreFlightCheck()
-        checker.LOG_DIR = tmp_path
-        checker.LOG_FILE = tmp_path / "checks.log"
-
-        result = checker.run("AAPL", "2024-05-10")
-        checker._log_result(result)
-
-        with open(checker.LOG_FILE) as f:
-            logged = json.load(f)
-
+        with instance.LOG_FILE.open() as file:
+            logged = json.load(file)
         assert logged["ticker"] == "AAPL"
-        assert logged["trade_date"] == "2024-05-10"
 
 
 class TestPreFlightCheckCLI:
-    """Test CLI functionality."""
-
-    @patch('sys.argv', ['pre_flight_check', 'AAPL', '2024-05-10'])
-    @patch('tradingagents.risk_management.pre_flight_check.PreFlightCheck.run')
-    def test_cli_pass(self, mock_run):
-        mock_run.return_value = {
+    @patch("sys.argv", ["pre_flight_check", "AAPL", "2024-05-10"])
+    @patch("tradingagents.risk_management.pre_flight_check.PreFlightCheck.run")
+    def test_cli_pass(self, run):
+        run.return_value = {
             "passed": True,
             "checks": [{"name": "test", "passed": True}],
-            "blocked_reason": None
+            "blocked_reason": None,
         }
-
-        # Should exit 0
-        with pytest.raises(SystemExit) as exc:
-            from tradingagents.risk_management.pre_flight_check import main
+        with pytest.raises(SystemExit, match="0"):
             main()
-
-        assert exc.value.code == 0
-
-    @patch('sys.argv', ['pre_flight_check', 'AAPL', '2024-05-10'])
-    @patch('tradingagents.risk_management.pre_flight_check.PreFlightCheck.run')
-    def test_cli_block(self, mock_run):
-        mock_run.return_value = {
-            "passed": False,
-            "checks": [{"name": "test", "passed": False, "reason": "Blocked"}],
-            "blocked_reason": "Blocked"
-        }
-
-        # Should exit 1
-        with pytest.raises(SystemExit) as exc:
-            from tradingagents.risk_management.pre_flight_check import main
-            main()
-
-        assert exc.value.code == 1

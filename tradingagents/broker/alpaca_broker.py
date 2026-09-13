@@ -4,7 +4,7 @@ AlpacaBroker - Alpaca券商API实现
 功能:
 1. Alpaca Markets API集成
 2. 股票交易（美股）
-3. Paper Trading（模拟盘）支持
+3. Paper Trading（模拟盘）只读支持
 4. 实时行情数据
 5. WebSocket实时订单更新（可选）
 
@@ -14,36 +14,33 @@ pip install alpaca-trade-api
 使用方法:
     broker = AlpacaBroker(api_key="KEY", api_secret="SECRET", paper=True)
     broker.connect()
-    order = broker.submit_order(order_request)
+    # 下单必须通过带签名授权和幂等保护的 Alpaca MCP。
 
 Created: 2026-06-03
 """
 
-from typing import Dict, Any, Optional, List
 from datetime import datetime
-import time
+from typing import Any, Dict, List, Optional
 
 try:
-    import alpaca
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, GetOrdersRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-    from alpaca.data.live.stock import StockDataStream
     from alpaca.data.historical.stock import StockHistoricalDataClient
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.enums import OrderSide
+
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
     print("⚠️ alpaca-trade-api未安装，请运行: pip install alpaca-trade-api")
 
 from .broker_interface import (
+    AccountInfo,
+    BrokerError,
     BrokerInterface,
     OrderRequest,
     OrderResponse,
     OrderStatus,
     OrderType,
-    AccountInfo,
     PositionInfo,
-    BrokerError
 )
 
 
@@ -138,94 +135,11 @@ class AlpacaBroker(BrokerInterface):
             raise BrokerError(f"Alpaca API断开失败: {str(e)}")
 
     def submit_order(self, order_request: OrderRequest) -> OrderResponse:
-        """提交订单到Alpaca
-
-        Args:
-            order_request: 订单请求
-
-        Returns:
-            OrderResponse: 订单响应
-
-        Raises:
-            BrokerError: Alpaca API错误
-        """
-        if not self.connected:
-            raise BrokerError("Alpaca API未连接")
-
-        try:
-            # 转换订单类型
-            alpaca_side = OrderSide.BUY if order_request.side.name == "BUY" else OrderSide.SELL
-            alpaca_time_in_force = TimeInForce.GTC  # Good Till Cancelled
-
-            # 创建Alpaca订单请求
-            if order_request.order_type == OrderType.MARKET:
-                # 市价单
-                alpaca_request = MarketOrderRequest(
-                    symbol=order_request.symbol,
-                    qty=order_request.quantity,
-                    side=alpaca_side,
-                    time_in_force=alpaca_time_in_force
-                )
-
-            elif order_request.order_type == OrderType.LIMIT:
-                # 限价单
-                if not order_request.limit_price:
-                    raise BrokerError("Limit订单缺少limit_price参数")
-
-                alpaca_request = LimitOrderRequest(
-                    symbol=order_request.symbol,
-                    qty=order_request.quantity,
-                    side=alpaca_side,
-                    time_in_force=alpaca_time_in_force,
-                    limit_price=order_request.limit_price
-                )
-
-            elif order_request.order_type == OrderType.STOP_LOSS:
-                # 止损单
-                if not order_request.stop_price:
-                    raise BrokerError("Stop订单缺少stop_price参数")
-
-                alpaca_request = StopOrderRequest(
-                    symbol=order_request.symbol,
-                    qty=order_request.quantity,
-                    side=alpaca_side,
-                    time_in_force=alpaca_time_in_force,
-                    stop_price=order_request.stop_price
-                )
-
-            else:
-                raise BrokerError(f"不支持的订单类型: {order_request.order_type}")
-
-            # 提交订单到Alpaca
-            alpaca_order = self.trading_client.submit_order(alpaca_request)
-
-            # 转换响应格式
-            return self._convert_alpaca_order_response(alpaca_order, order_request)
-
-        except Exception as e:
-            # 提取错误信息
-            error_message = str(e)
-            error_code = None
-
-            # 返回失败响应
-            return OrderResponse(
-                order_id="",
-                client_order_id=order_request.client_order_id or "",
-                symbol=order_request.symbol,
-                side=order_request.side,
-                quantity=order_request.quantity,
-                filled_quantity=0,
-                order_type=order_request.order_type,
-                limit_price=order_request.limit_price,
-                stop_price=order_request.stop_price,
-                status=OrderStatus.FAILED,
-                submitted_at=datetime.now(),
-                filled_at=None,
-                avg_fill_price=None,
-                total_cost=None,
-                commission=None,
-                error_message=error_message
-            )
+        """Reject the legacy unguarded execution path."""
+        del order_request
+        raise BrokerError(
+            "Direct AlpacaBroker submission is disabled; use the controlled Alpaca MCP"
+        )
 
     def cancel_order(self, order_id: str) -> bool:
         """取消Alpaca订单
